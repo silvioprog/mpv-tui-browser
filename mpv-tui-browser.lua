@@ -23,6 +23,8 @@ local function find_root()
 end
 
 mp.set_property("vo", "null")
+mp.commandv("change-list", "directory-filter-types", "remove", "image")
+mp.commandv("change-list", "cover-art-whitelist", "remove", ".folder")
 mp.set_property("msg-level", "all=no")
 local root = find_root()
 local stack = { root }
@@ -50,6 +52,7 @@ local cover_files = {}
 local cover_counter = 0
 local cover_running = false
 local cover_loading_path = nil
+local restarted_path = nil
 local ffi_loaded, ffi = pcall(require, "ffi")
 if ffi_loaded then
     ffi.cdef [[
@@ -66,6 +69,16 @@ end
 local function is_audio(name)
     local ext = name:match("%.([^.]+)$")
     return ext ~= nil and audio_exts[ext:lower()] == true
+end
+
+local image_exts = {}
+for _, ext in ipairs(mp.get_property_native("image-exts", {})) do
+    image_exts[ext] = true
+end
+
+local function is_image(name)
+    local ext = name:match("%.([^.]+)$")
+    return ext ~= nil and image_exts[ext:lower()] == true
 end
 
 local function sorted_names(dir, kind, keep)
@@ -285,8 +298,12 @@ local function render()
     local list_rows = height - art_rows - 6
     local has_art = path ~= nil and art_ready_path == path and list_rows >= 1
         and mp.get_property_number("video-params/dw") ~= nil
+    local between_files = path == nil and not mp.get_property_native("idle-active")
+    local cover_pending = between_files
+        or (path ~= nil and art_ready_path ~= path and (restarted_path ~= path or cover_loading_path == path))
+    local keep_art = not has_art and cover_pending and drawn_art_key ~= nil and list_rows >= 1
     local width = mp.get_property_native("term-size/w", 80)
-    local rows = math.max(1, has_art and list_rows or height - 5)
+    local rows = math.max(1, (has_art or keep_art) and list_rows or height - 5)
     if focus < first then
         first = focus
     elseif focus > first + rows - 1 then
@@ -317,8 +334,12 @@ local function render()
     end
     local art_top = #lines + 2
     local art_left = has_art and art_column(width, art_rows) or 1
-    local art_key = has_art and string.format("%s:%d:%d:%d", path, height, art_top, art_left) or nil
-    local art = art_key ~= drawn_art_key and table.concat(art_commands(art_key, art_top, art_left, art_rows)) or ""
+    local cover = mp.get_property("current-tracks/video/external-filename") or path
+    local art_key = has_art and string.format("%s:%d:%d:%d", cover, height, art_top, art_left) or nil
+    local art = ""
+    if not keep_art and art_key ~= drawn_art_key then
+        art = table.concat(art_commands(art_key, art_top, art_left, art_rows))
+    end
     io.write("\027[H", table.concat(lines, "\027[K\r\n"), "\027[K\027[J", art)
     io.flush()
 end
@@ -519,15 +540,36 @@ local function save_folder_cover(file, target)
     end
 end
 
+local function load_cover(file)
+    cover_loading_path = mp.get_property("path")
+    if not mp.commandv("video-add", file, "select", "", "", "yes") then
+        cover_loading_path = nil
+    end
+end
+
+local function folder_image_path()
+    local path = mp.get_property("path")
+    local dir = path and utils.split_path(path)
+    local name = dir and sorted_names(dir, "files", is_image)[1]
+    return name and utils.join_path(dir, name)
+end
+
 local function ensure_cover()
-    if not options.online_covers or not art_supported or mp.get_property_native("current-tracks/video") then
+    if not art_supported or mp.get_property_native("current-tracks/video") then
+        return
+    end
+    local image = folder_image_path()
+    if image then
+        load_cover(image)
         return
     end
     local folder_cover = folder_cover_path()
     local folder_cover_exists = folder_cover ~= nil and utils.file_info(folder_cover) ~= nil
     if folder_cover_exists then
-        cover_loading_path = mp.get_property("path")
-        mp.commandv("video-add", folder_cover, "select", "", "", "yes")
+        load_cover(folder_cover)
+        return
+    end
+    if not options.online_covers then
         return
     end
     local artist = mp.get_property("metadata/by-key/Artist")
@@ -541,8 +583,7 @@ local function ensure_cover()
         if folder_cover then
             save_folder_cover(cached, folder_cover)
         end
-        cover_loading_path = mp.get_property("path")
-        mp.commandv("video-add", cached, "select", "", "", "yes")
+        load_cover(cached)
     elseif cached == nil and not cover_running then
         cover_running = true
         fetch_cover(artist, album, function(file)
@@ -580,8 +621,9 @@ end)
 mp.register_event("playback-restart", function()
     local path = mp.get_property("path")
     art_ready_path = art_supported and mp.get_property_native("current-tracks/video") ~= nil and path or nil
-    render()
+    restarted_path = path
     ensure_cover()
+    render()
 end)
 
 mp.register_event("video-reconfig", function()
